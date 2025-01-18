@@ -1,0 +1,613 @@
+---
+title: "Predictive Customer Churn Analysis"
+author: "Durga Deepak Valluri"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+#Libraries
+library(tidyverse)
+library(caret)
+library(pROC)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(xgboost)
+library(scales)
+library(doParallel)
+```
+
+
+```{r}
+#Loading the data
+
+Tele_churn <- read.csv("C:/Users/vddee/Documents/WA_Fn-UseC_-Telco-Customer-Churn_R2.csv")
+
+#Structure of the Dataset
+str(Tele_churn)
+
+#Summary of the dataset values
+summary(Tele_churn)
+
+# Drop Irrelevant Columns
+Tele_churn <- Tele_churn %>% dplyr::select(-customerID)
+
+# Convert `Churn` to Factor
+Tele_churn$Churn <- factor(Tele_churn$Churn, levels = c(0, 1), labels = c("No", "Yes"))
+
+```
+
+As per the structure of the dataset given, columns like gender, seniorcitizen, partner, dependents and others already are in binary format which can be direcly used for modelling.
+
+The customerID column can be dropped as it is a unique identifier which doesnt serve any purpose for modelling. 
+```{r}
+#Checking for missing values
+any(is.na(Tele_churn))
+```
+
+There are no missing values in this dataset!
+
+```{r}
+# Handle Missing Values and Outliers
+Tele_churn <- Tele_churn %>%
+  mutate(
+    TotalCharges = ifelse(is.na(TotalCharges), 0, TotalCharges),
+    Tenure = ifelse(Tenure == 0 | is.na(Tenure), 1, Tenure)  # Avoid zero division
+  )
+
+# Scale Numeric Features
+num_features <- c("TotalCharges", "MonthlyCharges", "Tenure")
+Tele_churn <- Tele_churn %>%
+  mutate(across(all_of(num_features), scale))
+
+```
+Z-Score Interpretation:
+As it can be observed, a Z-score with threshold method 3 did not flag any outliers. 
+
+
+For further confirmation, box plots have been generated to check for outliers. 
+```{r}
+par(mar = c(1, 1, 1, 1))
+par(mfrow = c(2, 3))
+
+# Boxplot for TotalCharges
+boxplot(Tele_churn$TotalCharges,
+        main = "Boxplot of TotalCharges",
+        ylab = "TotalCharges",
+        horizontal = TRUE)
+
+# Boxplot for Tenure
+boxplot(Tele_churn$Tenure,
+        main = "Boxplot of Tenure",
+        ylab = "Tenure",
+        horizontal = TRUE)
+
+# Boxplot for MonthlyCharges
+boxplot(Tele_churn$MonthlyCharges,
+        main = "Boxplot of MonthlyCharges",
+        ylab = "MonthlyCharges",
+        horizontal = TRUE)
+
+```
+BoxPlot Interpretations:
+
+TotalCharges:
+- No visible outliers based on the boxplot.
+- Most data lies within a reasonable range, with a long tail extending towards 8000+.
+
+Tenure:
+- The distribution appears balanced.
+- No visible outliers, as the whiskers reach the extreme values in the dataset.
+
+MonthlyCharges:
+- No outliers are visible.
+- The data is centered, with values ranging from approximately 20 to 120.
+
+#Exploratory Data Analysis
+```{r}
+#First have to extract categorical and numerical columns
+
+par(mar = c(1, 1, 1, 1))
+
+#Categorical columns
+cat_threshold <- 3
+
+#function to classify as categorical
+is_categorical <- function(col) {
+  length(unique(col)) <= cat_threshold
+}
+
+#To identify columns with unique value counts below the threshold
+cat_cols <- sapply(Tele_churn, is_categorical)
+cat_columns <- names(cat_cols[cat_cols == TRUE])
+
+# Convert identified categorical columns to factors
+Tele_churn[cat_columns] <- lapply(Tele_churn[cat_columns], as.factor)
+
+#numerical columns
+num_cols <- c("Tenure", "MonthlyCharges", "TotalCharges")
+
+#Histogram for numerical variables
+for(col in num_cols) {
+  print(
+    ggplot(Tele_churn, aes(x = !!sym(col), fill = Churn)) +
+      geom_histogram(position = "identity", alpha = 0.6, bins = 30) +
+      ggtitle(paste("Distribution of", col, "by Churn")) +
+      xlab(col) +
+      ylab("Count") +
+      scale_fill_manual(values = c("steelblue", "tomato")) +
+      theme_minimal()
+  )
+}
+
+#Boxplots for Numerical Variables
+for (col in num_cols) {
+  print(
+    ggplot(Tele_churn, aes(x = Churn, y = !!sym(col), fill = Churn)) +
+      geom_boxplot(outlier.color = "red", outlier.shape = 16) +
+      ggtitle(paste(col, "by Churn")) +
+      xlab("Churn") +
+      ylab(col) +
+      scale_fill_manual(values = c("steelblue", "tomato")) +
+      theme_minimal()
+  )
+}
+
+#Bar Chart for categorical Variables
+for(col in cat_columns) {
+  print(
+    ggplot(Tele_churn, aes_string(x = col, fill = "Churn")) +
+      geom_bar(position = "fill", width = 0.7) +
+      scale_y_continuous(labels = percent) +
+      ggtitle(paste("Churn Proportion by", col)) +
+      xlab(col) +
+      ylab("Proportion") +
+      scale_fill_manual(values = c("steelblue", "tomato")) +
+      theme_minimal()
+  )
+}
+
+
+par(mfrow = c(4, 4))
+```
+
+#Feature Engineering
+```{r}
+# Adding new features
+Tele_churn <- Tele_churn %>%
+  mutate(
+    AvgMonthlySpend = TotalCharges / Tenure,
+    RateOfIncrease = MonthlyCharges / Tenure
+  )
+
+# Combine binary variables
+Tele_churn <- Tele_churn %>%
+  mutate(across(c(Partner, Dependents, SeniorCitizen), as.numeric)) %>%
+  mutate(
+    FamilyStatus = Partner * Dependents,
+    SeniorLoyalty = SeniorCitizen * Tenure
+  )
+
+# Add Customer Lifetime Value (CLV)
+Tele_churn <- Tele_churn %>%
+  mutate(CLV = AvgMonthlySpend * Tenure)
+
+# Add usage patterns
+online_services <- c("OnlineSecurity", "OnlineBackup", "DeviceProtection", 
+                     "TechSupport", "StreamingTV", "StreamingMovies")
+Tele_churn <- Tele_churn %>%
+  mutate(across(all_of(online_services), ~ as.numeric(as.character(.)))) %>%
+  mutate(
+    OnlineServicesUsed = rowSums(select(., all_of(online_services)), na.rm = TRUE),
+    UsageIntensity = MonthlyCharges * OnlineServicesUsed
+  )
+
+# Correlation matrix for numeric features
+numeric_data <- Tele_churn %>%
+  select(where(is.numeric))
+correlation_matrix <- cor(numeric_data, use = "pairwise.complete.obs")
+corrplot(correlation_matrix, method = "color", type = "lower", 
+         title = "Correlation Matrix of Numeric Features",
+         tl.col = "black", tl.srt = 45)
+
+```
+
+#Model Building
+```{r}
+# Splitting the dataset
+set.seed(42)
+idx_split <- createDataPartition(Tele_churn$Churn, p = 0.8, list = FALSE)
+train_set <- Tele_churn[idx_split, ]
+test_set <- Tele_churn[-idx_split, ]
+
+
+```
+
+```{r}
+# Logistic Regression
+log_mod <- glm(Churn ~ ., data = train_set, family = binomial)
+
+# Predictions
+log_preds <- predict(log_mod, newdata = test_set, type = "response")
+log_cls <- ifelse(log_preds > 0.5, "Yes", "No")
+
+# Confusion Matrix
+log_eval <- confusionMatrix(factor(log_cls), factor(test_set$Churn))
+print(log_eval)
+
+```
+
+```{r}
+# Decision Tree
+library(rpart)
+
+tree_mod <- rpart(Churn ~ ., data = train_set, method = "class")
+
+# Predictions
+tree_preds <- predict(tree_mod, newdata = test_set, type = "class")
+
+# Confusion Matrix
+tree_eval <- confusionMatrix(factor(tree_preds), factor(test_set$Churn))
+print(tree_eval)
+
+```
+```{r}
+# Random Forest
+library(randomForest)
+
+rf_mod <- randomForest(Churn ~ ., data = train_set, ntree = 100, mtry = 3)
+
+# Predictions
+rf_preds <- predict(rf_mod, newdata = test_set)
+
+# Confusion Matrix
+rf_eval <- confusionMatrix(factor(rf_preds), factor(test_set$Churn))
+print(rf_eval)
+
+```
+```{r}
+# SVM
+svm_mod <- svm(Churn ~ ., data = train_set, kernel = "radial")
+
+# Predictions
+svm_preds <- predict(svm_mod, newdata = test_set)
+
+# Confusion Matrix
+svm_eval <- confusionMatrix(factor(svm_preds), factor(test_set$Churn))
+print(svm_eval)
+
+```
+```{r}
+# Prepare Data for XGBoost Locally
+train_xgb_local <- train_set
+test_xgb_local <- test_set
+
+# Convert Churn to numeric locally for XGBoost
+train_xgb_local$Churn <- as.numeric(train_xgb_local$Churn == "Yes")
+test_xgb_local$Churn <- as.numeric(test_xgb_local$Churn == "Yes")
+
+# Identify non-numeric columns for local encoding
+non_numeric_cols <- sapply(train_xgb_local, function(col) !is.numeric(col))
+non_numeric_cols <- names(non_numeric_cols[non_numeric_cols])
+
+# One-Hot Encoding for Non-Numeric Columns Locally
+if (length(non_numeric_cols) > 0) {
+  # Create dummy variables for non-numeric columns
+  dummy_vars <- dummyVars(~ ., data = train_xgb_local[, non_numeric_cols], fullRank = TRUE)
+  
+  # Encode training and test datasets
+  encoded_train <- predict(dummy_vars, newdata = train_xgb_local)
+  encoded_test <- predict(dummy_vars, newdata = test_xgb_local)
+  
+  # Drop non-numeric columns and bind encoded columns
+  train_xgb_local <- cbind(train_xgb_local[, !names(train_xgb_local) %in% non_numeric_cols], encoded_train)
+  test_xgb_local <- cbind(test_xgb_local[, !names(test_xgb_local) %in% non_numeric_cols], encoded_test)
+}
+
+# Ensure all features are numeric for XGBoost
+xgb_train <- xgb.DMatrix(
+  data = as.matrix(train_xgb_local[, -which(names(train_xgb_local) == "Churn")]), 
+  label = train_xgb_local$Churn
+)
+xgb_test <- xgb.DMatrix(
+  data = as.matrix(test_xgb_local[, -which(names(test_xgb_local) == "Churn")]), 
+  label = test_xgb_local$Churn
+)
+
+# Train XGBoost Model Locally
+xgb_mod <- xgboost(
+  data = xgb_train, 
+  max.depth = 6, 
+  nrounds = 100, 
+  objective = "binary:logistic", 
+  verbose = 0  # Suppress training output
+)
+
+# Predictions and Classification
+xgb_preds <- predict(xgb_mod, newdata = xgb_test)
+xgb_cls <- ifelse(xgb_preds > 0.5, 1, 0)
+
+# Confusion Matrix
+xgb_eval <- confusionMatrix(
+  factor(xgb_cls, levels = c(0, 1)),  # Ensure levels match numeric labels
+  factor(test_xgb_local$Churn, levels = c(0, 1))  # Ensure test labels are numeric and match
+)
+
+# Print Evaluation Results
+print(xgb_eval)
+
+```
+##Hyperparameter Tuning
+
+```{r}
+# Logistic Regression with Cross-Validation
+library(caret)
+
+set.seed(42)
+ctrl <- trainControl(method = "cv", number = 5)  # 5-fold cross-validation
+
+log_tuned <- train(
+  Churn ~ ., 
+  data = train_set, 
+  method = "glm",
+  family = "binomial",
+  trControl = ctrl
+)
+
+print(log_tuned)
+
+```
+```{r}
+# Decision Tree with Cross-Validation
+set.seed(42)
+tree_tuned <- train(
+  Churn ~ ., 
+  data = train_set, 
+  method = "rpart",
+  trControl = ctrl,
+  tuneLength = 10  # Automatically tune over 10 values
+)
+
+print(tree_tuned)
+
+```
+```{r}
+# Random Forest with Cross-Validation
+set.seed(42)
+rf_tuned <- train(
+  Churn ~ ., 
+  data = train_set, 
+  method = "rf",
+  tuneLength = 5,  # Automatically test 5 combinations of mtry
+  trControl = ctrl
+)
+
+print(rf_tuned)
+
+```
+
+
+```{r}
+# Encode data locally for SVM
+svm_train <- train_set
+svm_test <- test_set
+svm_train$Churn <- as.factor(ifelse(svm_train$Churn == "Yes", 1, 0))
+svm_test$Churn <- as.factor(ifelse(svm_test$Churn == "Yes", 1, 0))
+
+
+# SVM with Cross-Validation
+set.seed(42)
+svm_tuned <- train(
+  Churn ~ ., 
+  data = svm_train, 
+  method = "svmRadial",
+  tuneGrid = expand.grid(
+    C = c(0.5, 1, 2),     # Penalty parameter
+    sigma = c(0.01, 0.05, 0.1)  # Kernel width
+  ),
+  trControl = ctrl
+)
+
+print(svm_tuned)
+
+
+```
+
+```{r}
+# Prepare Data for XGBoost Locally
+train_xgb_local <- train_set
+test_xgb_local <- test_set
+
+# Convert Churn to numeric locally for XGBoost
+train_xgb_local$Churn <- as.numeric(train_xgb_local$Churn == "Yes")
+test_xgb_local$Churn <- as.numeric(test_xgb_local$Churn == "Yes")
+
+# Identify non-numeric columns for local encoding
+non_numeric_cols <- sapply(train_xgb_local, function(col) !is.numeric(col))
+non_numeric_cols <- names(non_numeric_cols[non_numeric_cols])
+
+# One-hot encode non-numeric columns locally
+if (length(non_numeric_cols) > 0) {
+  dummy_vars <- dummyVars(~ ., data = train_xgb_local[, non_numeric_cols], fullRank = TRUE)
+  
+  encoded_train <- predict(dummy_vars, newdata = train_xgb_local)
+  encoded_test <- predict(dummy_vars, newdata = test_xgb_local)
+  
+  # Drop non-numeric columns and bind encoded columns
+  train_xgb_local <- cbind(train_xgb_local[, !names(train_xgb_local) %in% non_numeric_cols], encoded_train)
+  test_xgb_local <- cbind(test_xgb_local[, !names(test_xgb_local) %in% non_numeric_cols], encoded_test)
+}
+
+```
+
+```{r}
+# XGBoost with Cross-Validation
+xgb_tuned <- train(
+  Churn ~ ., 
+  data = train_xgb_local, 
+  method = "xgbTree",
+  trControl = ctrl,
+  tuneGrid = expand.grid(
+    nrounds = c(50, 100),        # Number of boosting rounds
+    max_depth = c(3, 6),         # Maximum tree depth
+    eta = c(0.01, 0.1, 0.3),    # Learning rate
+    gamma = c(0, 1),             # Minimum loss reduction
+    colsample_bytree = c(0.6, 0.8),  # Subsample ratio of columns
+    min_child_weight = c(1, 5),  # Minimum sum of instance weight
+    subsample = c(0.6, 0.8)      # Subsample ratio of training instances
+  )
+)
+
+print(xgb_tuned)
+
+```
+```{r}
+# Load Required Libraries
+library(pROC)
+library(ggplot2)
+library(caret)
+library(dplyr)
+library(tidyr)
+
+# Initialize a list to store evaluation metrics
+model_metrics <- list()
+
+# Ensure `Churn` in `test_set` has consistent factor levels
+test_set$Churn <- factor(test_set$Churn, levels = c("No", "Yes"))
+test_xgb_local$Churn <- factor(test_xgb_local$Churn, levels = c("No", "Yes"))
+
+# Logistic Regression Evaluation
+cat("\nLogistic Regression Evaluation:\n")
+log_cls <- factor(log_cls, levels = c("No", "Yes"))  # Ensure consistent levels
+log_eval <- confusionMatrix(log_cls, test_set$Churn)
+log_auc <- roc(as.numeric(test_set$Churn == "Yes"), log_preds)
+model_metrics$Logistic <- data.frame(
+  Accuracy = log_eval$overall["Accuracy"],
+  Precision = log_eval$byClass["Precision"],
+  Recall = log_eval$byClass["Recall"],
+  F1 = log_eval$byClass["F1"],
+  AUC = auc(log_auc)
+)
+print(log_eval)
+
+# Decision Tree Evaluation
+cat("\nDecision Tree Evaluation:\n")
+tree_cls <- factor(tree_preds, levels = c("No", "Yes"))  # Ensure consistent levels
+tree_eval <- confusionMatrix(tree_cls, test_set$Churn)
+tree_auc <- roc(as.numeric(test_set$Churn == "Yes"), as.numeric(tree_cls == "Yes"))
+model_metrics$DecisionTree <- data.frame(
+  Accuracy = tree_eval$overall["Accuracy"],
+  Precision = tree_eval$byClass["Precision"],
+  Recall = tree_eval$byClass["Recall"],
+  F1 = tree_eval$byClass["F1"],
+  AUC = auc(tree_auc)
+)
+print(tree_eval)
+
+# Random Forest Evaluation
+cat("\nRandom Forest Evaluation:\n")
+rf_cls <- factor(rf_preds, levels = c("No", "Yes"))  # Ensure consistent levels
+rf_eval <- confusionMatrix(rf_cls, test_set$Churn)
+rf_auc <- roc(as.numeric(test_set$Churn == "Yes"), as.numeric(rf_cls == "Yes"))
+model_metrics$RandomForest <- data.frame(
+  Accuracy = rf_eval$overall["Accuracy"],
+  Precision = rf_eval$byClass["Precision"],
+  Recall = rf_eval$byClass["Recall"],
+  F1 = rf_eval$byClass["F1"],
+  AUC = auc(rf_auc)
+)
+print(rf_eval)
+
+# Support Vector Machine Evaluation
+cat("\nSupport Vector Machine Evaluation:\n")
+svm_cls <- factor(svm_preds, levels = c("No", "Yes"))  # Ensure consistent levels
+svm_eval <- confusionMatrix(svm_cls, test_set$Churn)
+svm_auc <- roc(as.numeric(test_set$Churn == "Yes"), as.numeric(svm_cls == "Yes"))
+model_metrics$SVM <- data.frame(
+  Accuracy = svm_eval$overall["Accuracy"],
+  Precision = svm_eval$byClass["Precision"],
+  Recall = svm_eval$byClass["Recall"],
+  F1 = svm_eval$byClass["F1"],
+  AUC = auc(svm_auc)
+)
+print(svm_eval)
+
+# XGBoost Evaluation
+cat("\nXGBoost Evaluation:\n")
+xgb_cls <- ifelse(xgb_preds > 0.5, "Yes", "No")  # Convert predictions to binary
+xgb_cls <- factor(xgb_cls, levels = c("No", "Yes"))  # Ensure consistent levels
+xgb_eval <- confusionMatrix(xgb_cls, test_xgb_local$Churn)
+xgb_auc <- roc(as.numeric(test_xgb_local$Churn == "Yes"), xgb_preds)
+model_metrics$XGBoost <- data.frame(
+  Accuracy = xgb_eval$overall["Accuracy"],
+  Precision = xgb_eval$byClass["Precision"],
+  Recall = xgb_eval$byClass["Recall"],
+  F1 = xgb_eval$byClass["F1"],
+  AUC = auc(xgb_auc)
+)
+print(xgb_eval)
+
+# Combine All Metrics into a Data Frame
+all_metrics <- do.call(rbind, model_metrics)
+rownames(all_metrics) <- names(model_metrics)
+print(all_metrics)
+
+# Visualize Metrics
+all_metrics_long <- all_metrics %>%
+  rownames_to_column("Model") %>%
+  pivot_longer(cols = c(Accuracy, Precision, Recall, F1, AUC), names_to = "Metric", values_to = "Value")
+
+ggplot(all_metrics_long, aes(x = Model, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_minimal() +
+  labs(title = "Model Evaluation Metrics", x = "Model", y = "Value")
+
+# Plot ROC Curves for All Models
+roc_list <- list(
+  Logistic = log_auc,
+  DecisionTree = tree_auc,
+  RandomForest = rf_auc,
+  SVM = svm_auc,
+  XGBoost = xgb_auc
+)
+
+roc_df <- data.frame()
+for (model_name in names(roc_list)) {
+  roc_data <- data.frame(
+    TPR = rev(roc_list[[model_name]]$sensitivities),
+    FPR = rev(1 - roc_list[[model_name]]$specificities),
+    Model = model_name
+  )
+  roc_df <- rbind(roc_df, roc_data)
+}
+
+ggplot(roc_df, aes(x = FPR, y = TPR, color = Model)) +
+  geom_line() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "ROC Curves for Models", x = "False Positive Rate", y = "True Positive Rate")
+
+# Feature Importance for Tree-Based Models
+cat("\nFeature Importance:\n")
+# Random Forest Feature Importance
+rf_importance <- varImp(rf_mod, scale = FALSE)
+print(rf_importance)
+plot(rf_importance, main = "Random Forest Feature Importance")
+
+# XGBoost Feature Importance
+xgb_importance <- xgb.importance(feature_names = colnames(as.matrix(train_xgb[, -which(names(train_xgb) == "Churn")])), model = xgb_mod)
+print(xgb_importance)
+xgb.plot.importance(xgb_importance, main = "XGBoost Feature Importance")
+
+
+```
+
+
+
+
